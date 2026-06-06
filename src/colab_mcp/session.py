@@ -16,6 +16,7 @@ import asyncio
 from collections.abc import AsyncIterator
 import contextlib
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from fastmcp import FastMCP, Client
 from fastmcp.client.transports import ClientTransport
 from fastmcp.dependencies import CurrentContext
@@ -26,16 +27,103 @@ from fastmcp.server.proxy import FastMCPProxy
 from fastmcp.tools.tool import Tool, ToolResult
 from mcp.client.session import ClientSession
 from mcp.types import TextContent
+import logging
+import shlex
+import shutil
+import subprocess
+import sys
 import webbrowser
 
 from colab_mcp.websocket_server import ColabWebSocketServer, COLAB, SCRATCH_PATH
 
-UI_CONNECTION_TIMEOUT = 60.0  # secs
+DEFAULT_UI_CONNECTION_TIMEOUT = 60.0  # secs
 
 FE_CONNECTED_KEY = "fe_connected"
 PROXY_TOKEN_KEY = "proxy_token"
 PROXY_PORT_KEY = "proxy_port"
+PROXY_CONNECTION_URL_KEY = "proxy_connection_url"
+PROXY_CONNECTION_TIMEOUT_KEY = "proxy_connection_timeout"
+PROXY_BROWSER_COMMAND_KEY = "proxy_browser_command"
+PROXY_BROWSER_PROFILE_KEY = "proxy_browser_profile"
+PROXY_BROWSER_USER_DATA_DIR_KEY = "proxy_browser_user_data_dir"
+PROXY_PRINT_CONNECTION_URL_KEY = "proxy_print_connection_url"
 INJECTED_TOOL_NAME = "open_colab_browser_connection"
+STATUS_TOOL_NAME = "get_colab_connection_status"
+
+CHROME_COMMAND_CANDIDATES = (
+    "google-chrome-stable",
+    "google-chrome",
+    "chrome",
+    "chromium",
+    "chromium-browser",
+)
+
+
+@dataclass(frozen=True)
+class BrowserLaunchConfig:
+    command: str | None = None
+    profile: str | None = None
+    user_data_dir: str | None = None
+    connection_timeout: float = DEFAULT_UI_CONNECTION_TIMEOUT
+    print_connection_url: bool = False
+
+    def uses_explicit_browser(self) -> bool:
+        return bool(self.command or self.profile or self.user_data_dir)
+
+
+def build_colab_connection_url(token: str, port: int | str) -> str:
+    return f"{COLAB}{SCRATCH_PATH}#mcpProxyToken={token}&mcpProxyPort={port}"
+
+
+def redact_connection_url(url: str, token: str | None) -> str:
+    if not token:
+        return url
+    return url.replace(f"mcpProxyToken={token}", "mcpProxyToken=<redacted>")
+
+
+def resolve_browser_command(config: BrowserLaunchConfig) -> str | None:
+    if config.command:
+        return config.command
+    if not config.uses_explicit_browser():
+        return None
+    for candidate in CHROME_COMMAND_CANDIDATES:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    raise RuntimeError(
+        "A Chrome profile or user data directory was configured, but no Chrome "
+        "or Chromium executable was found. Set --browser-command or "
+        "COLAB_MCP_BROWSER_COMMAND."
+    )
+
+
+def browser_launch_args(url: str, config: BrowserLaunchConfig) -> list[str] | None:
+    command = resolve_browser_command(config)
+    if not command:
+        return None
+    args = shlex.split(command)
+    if config.user_data_dir:
+        args.append(f"--user-data-dir={config.user_data_dir}")
+    if config.profile:
+        args.append(f"--profile-directory={config.profile}")
+    args.append(url)
+    return args
+
+
+def open_colab_browser(url: str, config: BrowserLaunchConfig) -> None:
+    if config.print_connection_url:
+        print(f"Colab MCP connection URL: {url}", file=sys.stderr, flush=True)
+    args = browser_launch_args(url, config)
+    if args is None:
+        webbrowser.open_new(url)
+        return
+    logging.info("Opening Colab with browser command: %s", shlex.join(args[:-1]))
+    subprocess.Popen(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 class ColabTransport(ClientTransport):
@@ -54,8 +142,13 @@ class ColabTransport(ClientTransport):
 
 
 class ColabProxyClient:
-    def __init__(self, wss: ColabWebSocketServer):
+    def __init__(
+        self,
+        wss: ColabWebSocketServer,
+        browser_config: BrowserLaunchConfig | None = None,
+    ):
         self.wss = wss
+        self.browser_config = browser_config or BrowserLaunchConfig()
         self.stubbed_mcp_client = Client(FastMCP())
         self.proxy_mcp_client: Client | None = None
         self._exit_stack = AsyncExitStack()
@@ -72,7 +165,7 @@ class ColabProxyClient:
             )
             await asyncio.wait_for(
                 connection_tasks,
-                timeout=UI_CONNECTION_TIMEOUT,
+                timeout=self.browser_config.connection_timeout,
             )
 
     def client_factory(self):
@@ -112,6 +205,30 @@ class ColabProxyMiddleware(Middleware):
         )
         context.fastmcp_context.set_state(PROXY_TOKEN_KEY, self.proxy_client.wss.token)
         context.fastmcp_context.set_state(PROXY_PORT_KEY, self.proxy_client.wss.port)
+        context.fastmcp_context.set_state(
+            PROXY_CONNECTION_URL_KEY,
+            build_colab_connection_url(
+                self.proxy_client.wss.token, self.proxy_client.wss.port
+            ),
+        )
+        context.fastmcp_context.set_state(
+            PROXY_CONNECTION_TIMEOUT_KEY,
+            self.proxy_client.browser_config.connection_timeout,
+        )
+        context.fastmcp_context.set_state(
+            PROXY_BROWSER_COMMAND_KEY, self.proxy_client.browser_config.command
+        )
+        context.fastmcp_context.set_state(
+            PROXY_BROWSER_PROFILE_KEY, self.proxy_client.browser_config.profile
+        )
+        context.fastmcp_context.set_state(
+            PROXY_BROWSER_USER_DATA_DIR_KEY,
+            self.proxy_client.browser_config.user_data_dir,
+        )
+        context.fastmcp_context.set_state(
+            PROXY_PRINT_CONNECTION_URL_KEY,
+            self.proxy_client.browser_config.print_connection_url,
+        )
 
         result = await call_next(context)
 
@@ -136,7 +253,10 @@ class ColabProxyMiddleware(Middleware):
         await context.fastmcp_context.report_progress(
             progress=2,
             total=3,
-            message="Waiting for user to connect in Colab - will wait for 60s",
+            message=(
+                "Waiting for user to connect in Colab - will wait for "
+                f"{self.proxy_client.browser_config.connection_timeout:g}s"
+            ),
         )
         await self.proxy_client.await_proxy_connection()
         if self.proxy_client.is_connected():
@@ -165,10 +285,45 @@ async def check_session_proxy_tool_fn(ctx: Context = CurrentContext()) -> bool:
     port = ctx.get_state(PROXY_PORT_KEY)
     if fe_connected:
         return True
-    webbrowser.open_new(
-        f"{COLAB}{SCRATCH_PATH}#mcpProxyToken={token}&mcpProxyPort={port}"
+    url = ctx.get_state(PROXY_CONNECTION_URL_KEY) or build_colab_connection_url(
+        token, port
     )
+    config = BrowserLaunchConfig(
+        command=ctx.get_state(PROXY_BROWSER_COMMAND_KEY),
+        profile=ctx.get_state(PROXY_BROWSER_PROFILE_KEY),
+        user_data_dir=ctx.get_state(PROXY_BROWSER_USER_DATA_DIR_KEY),
+        connection_timeout=ctx.get_state(PROXY_CONNECTION_TIMEOUT_KEY)
+        or DEFAULT_UI_CONNECTION_TIMEOUT,
+        print_connection_url=bool(ctx.get_state(PROXY_PRINT_CONNECTION_URL_KEY)),
+    )
+    open_colab_browser(url, config)
     return False
+
+
+async def get_colab_connection_status_tool_fn(
+    ctx: Context = CurrentContext(),
+) -> dict[str, object]:
+    fe_connected = bool(ctx.get_state(FE_CONNECTED_KEY))
+    token = ctx.get_state(PROXY_TOKEN_KEY)
+    port = ctx.get_state(PROXY_PORT_KEY)
+    url = ctx.get_state(PROXY_CONNECTION_URL_KEY) or build_colab_connection_url(
+        token, port
+    )
+    return {
+        "connected": fe_connected,
+        "proxy_port": port,
+        "connection_url_redacted": redact_connection_url(url, token),
+        "connection_timeout_seconds": ctx.get_state(PROXY_CONNECTION_TIMEOUT_KEY)
+        or DEFAULT_UI_CONNECTION_TIMEOUT,
+        "browser": {
+            "command": ctx.get_state(PROXY_BROWSER_COMMAND_KEY),
+            "profile": ctx.get_state(PROXY_BROWSER_PROFILE_KEY),
+            "user_data_dir": ctx.get_state(PROXY_BROWSER_USER_DATA_DIR_KEY),
+            "print_connection_url": bool(
+                ctx.get_state(PROXY_PRINT_CONNECTION_URL_KEY)
+            ),
+        },
+    }
 
 
 check_session_proxy_tool = Tool.from_function(
@@ -177,10 +332,17 @@ check_session_proxy_tool = Tool.from_function(
     description="Opens a connection to a Google Colab browser session and unlocks notebook editing tools. Returns a boolean representing whether the connection attempt succeeded",
 )
 
+get_colab_connection_status_tool = Tool.from_function(
+    fn=get_colab_connection_status_tool_fn,
+    name=STATUS_TOOL_NAME,
+    description="Returns redacted Colab MCP connection diagnostics including browser configuration, proxy port, timeout, and connected state.",
+)
+
 
 class ColabSessionProxy:
-    def __init__(self):
+    def __init__(self, browser_config: BrowserLaunchConfig | None = None):
         self._exit_stack = AsyncExitStack()
+        self.browser_config = browser_config or BrowserLaunchConfig()
         self.proxy_server: FastMCPProxy | None = None
         # list order matters, see: https://gofastmcp.com/servers/middleware#multiple-middleware
         self.middleware: list[Middleware] = []
@@ -189,7 +351,7 @@ class ColabSessionProxy:
     async def start_proxy_server(self):
         self.wss = await self._exit_stack.enter_async_context(ColabWebSocketServer())
         proxy_client = await self._exit_stack.enter_async_context(
-            ColabProxyClient(self.wss)
+            ColabProxyClient(self.wss, self.browser_config)
         )
         self.proxy_server = FastMCPProxy(
             client_factory=proxy_client.client_factory,
@@ -198,7 +360,12 @@ class ColabSessionProxy:
         # ColabProxyMiddleware must be first because it sets the fe_connected state
         self.middleware.append(ColabProxyMiddleware(proxy_client))
         self.middleware.append(
-            ToolInjectionMiddleware(tools=[check_session_proxy_tool])
+            ToolInjectionMiddleware(
+                tools=[
+                    check_session_proxy_tool,
+                    get_colab_connection_status_tool,
+                ]
+            )
         )
 
     async def cleanup(self):

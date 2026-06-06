@@ -53,6 +53,7 @@ class MockColabWebSocketServer:
 def mock_proxy_client(mock_wss):
     client = Mock(spec=session.ColabProxyClient)
     client.wss = mock_wss
+    client.browser_config = session.BrowserLaunchConfig()
     client.is_connected.return_value = False
     return client
 
@@ -173,6 +174,64 @@ class TestCheckSessionProxyToolFn:
         assert "mcpProxyToken=test-token" in args[0]
         assert "mcpProxyPort=1234" in args[0]
 
+    @pytest.mark.asyncio
+    async def test_disconnected_with_browser_profile(self, monkeypatch):
+        popen = Mock()
+        monkeypatch.setattr(session.subprocess, "Popen", popen)
+        monkeypatch.setattr(
+            session.shutil,
+            "which",
+            lambda name: "/usr/bin/google-chrome-stable"
+            if name == "google-chrome-stable"
+            else None,
+        )
+        ctx = Mock()
+        values = {
+            session.FE_CONNECTED_KEY: False,
+            session.PROXY_TOKEN_KEY: "test-token",
+            session.PROXY_PORT_KEY: 1234,
+            session.PROXY_BROWSER_PROFILE_KEY: "Default",
+            session.PROXY_BROWSER_USER_DATA_DIR_KEY: "/home/astra/.config/google-chrome",
+            session.PROXY_CONNECTION_TIMEOUT_KEY: 180.0,
+        }
+        ctx.get_state.side_effect = lambda k: values.get(k)
+
+        assert await session.check_session_proxy_tool_fn(ctx) is False
+
+        popen.assert_called_once()
+        args = popen.call_args.args[0]
+        assert args[0] == "/usr/bin/google-chrome-stable"
+        assert "--user-data-dir=/home/astra/.config/google-chrome" in args
+        assert "--profile-directory=Default" in args
+        assert "mcpProxyToken=test-token" in args[-1]
+
+
+class TestGetColabConnectionStatusToolFn:
+    @pytest.mark.asyncio
+    async def test_status_redacts_token(self):
+        ctx = Mock()
+        values = {
+            session.FE_CONNECTED_KEY: False,
+            session.PROXY_TOKEN_KEY: "test-token",
+            session.PROXY_PORT_KEY: 1234,
+            session.PROXY_CONNECTION_URL_KEY: "https://colab.research.google.com/notebooks/empty.ipynb#mcpProxyToken=test-token&mcpProxyPort=1234",
+            session.PROXY_BROWSER_COMMAND_KEY: "google-chrome-stable",
+            session.PROXY_BROWSER_PROFILE_KEY: "Default",
+            session.PROXY_BROWSER_USER_DATA_DIR_KEY: "/home/astra/.config/google-chrome",
+            session.PROXY_CONNECTION_TIMEOUT_KEY: 180.0,
+            session.PROXY_PRINT_CONNECTION_URL_KEY: False,
+        }
+        ctx.get_state.side_effect = lambda k: values.get(k)
+
+        result = await session.get_colab_connection_status_tool_fn(ctx)
+
+        assert result["connected"] is False
+        assert result["proxy_port"] == 1234
+        assert "test-token" not in result["connection_url_redacted"]
+        assert "mcpProxyToken=<redacted>" in result["connection_url_redacted"]
+        assert result["connection_timeout_seconds"] == 180.0
+        assert result["browser"]["profile"] == "Default"
+
 
 class TestColabProxyClient:
     def test_is_connected(self, mock_wss):
@@ -196,11 +255,12 @@ class TestColabProxyClient:
 
     @pytest.mark.asyncio
     async def test_await_proxy_connection(self, mock_wss):
-        client = session.ColabProxyClient(mock_wss)
+        client = session.ColabProxyClient(
+            mock_wss, session.BrowserLaunchConfig(connection_timeout=0.1)
+        )
         client._start_task = asyncio.create_task(asyncio.sleep(0.01))
         mock_wss.connection_live.set()
-        with patch("colab_mcp.session.UI_CONNECTION_TIMEOUT", 0.1):
-            await client.await_proxy_connection()
+        await client.await_proxy_connection()
         await client._start_task
 
     @pytest.mark.asyncio
@@ -251,12 +311,43 @@ class TestColabSessionProxy:
     ):
         mock_colab_web_socket_server.return_value.__aenter__ = AsyncMock()
         mock_colab_proxy_client.return_value.__aenter__ = AsyncMock()
-        proxy = session.ColabSessionProxy()
+        config = session.BrowserLaunchConfig(profile="Default")
+        proxy = session.ColabSessionProxy(config)
         await proxy.start_proxy_server()
         mock_colab_proxy_client.assert_called_once()
+        assert mock_colab_proxy_client.call_args.args[1] is config
         assert proxy.proxy_server is not None
         mock_colab_proxy_middleware.assert_called_once()
         mock_tool_injection_middleware.assert_called_once()
+
+
+class TestBrowserLaunchHelpers:
+    def test_default_browser_launch(self, mock_webbrowser):
+        session.open_colab_browser(
+            "https://colab.research.google.com/notebooks/empty.ipynb",
+            session.BrowserLaunchConfig(),
+        )
+
+        mock_webbrowser.assert_called_once_with(
+            "https://colab.research.google.com/notebooks/empty.ipynb"
+        )
+
+    def test_browser_launch_args_with_explicit_command(self):
+        args = session.browser_launch_args(
+            "https://example.com",
+            session.BrowserLaunchConfig(
+                command="google-chrome-stable",
+                profile="Default",
+                user_data_dir="/home/astra/.config/google-chrome",
+            ),
+        )
+
+        assert args == [
+            "google-chrome-stable",
+            "--user-data-dir=/home/astra/.config/google-chrome",
+            "--profile-directory=Default",
+            "https://example.com",
+        ]
 
     @pytest.mark.asyncio
     async def test_cleanup(self):

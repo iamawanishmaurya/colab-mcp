@@ -16,16 +16,38 @@ import argparse
 import asyncio
 import datetime
 import logging
+import os
 import tempfile
 import sys
 
 from fastmcp import FastMCP
 from fastmcp.utilities import logging as fastmcp_logger
 
-from colab_mcp.session import ColabSessionProxy
+from colab_mcp.session import BrowserLaunchConfig, ColabSessionProxy
 
 
 mcp = FastMCP(name="ColabMCP")
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return positive_float(value)
+
+
+def positive_float(value: str | float) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 def init_logger(logdir):
@@ -60,6 +82,49 @@ def parse_args(v):
         action="store_true",
         default=True,
     )
+    parser.add_argument(
+        "--browser-command",
+        help=(
+            "browser executable or command used to open Colab. "
+            "Defaults to COLAB_MCP_BROWSER_COMMAND, or an auto-detected "
+            "Chrome/Chromium binary when profile options are set."
+        ),
+        default=os.environ.get("COLAB_MCP_BROWSER_COMMAND"),
+    )
+    parser.add_argument(
+        "--browser-profile",
+        help=(
+            "Chrome profile directory to open, for example 'Default'. "
+            "Defaults to COLAB_MCP_BROWSER_PROFILE."
+        ),
+        default=os.environ.get("COLAB_MCP_BROWSER_PROFILE"),
+    )
+    parser.add_argument(
+        "--browser-user-data-dir",
+        help=(
+            "Chrome user data directory, for example ~/.config/google-chrome. "
+            "Defaults to COLAB_MCP_BROWSER_USER_DATA_DIR."
+        ),
+        default=os.environ.get("COLAB_MCP_BROWSER_USER_DATA_DIR"),
+    )
+    parser.add_argument(
+        "--connection-timeout",
+        help=(
+            "seconds to wait for the Colab browser UI to connect. "
+            "Defaults to COLAB_MCP_CONNECTION_TIMEOUT or 60."
+        ),
+        type=positive_float,
+        default=env_float("COLAB_MCP_CONNECTION_TIMEOUT", 60.0),
+    )
+    parser.add_argument(
+        "--print-connection-url",
+        help=(
+            "write the generated Colab connection URL to stderr when opening "
+            "the browser. Defaults to COLAB_MCP_PRINT_CONNECTION_URL."
+        ),
+        action="store_true",
+        default=env_bool("COLAB_MCP_PRINT_CONNECTION_URL"),
+    )
     return parser.parse_args(v)
 
 
@@ -69,7 +134,15 @@ async def main_async():
 
     if args.enable_proxy:
         logging.info("enabling session proxy tools")
-        session_mcp = ColabSessionProxy()
+        session_mcp = ColabSessionProxy(
+            BrowserLaunchConfig(
+                command=args.browser_command,
+                profile=args.browser_profile,
+                user_data_dir=args.browser_user_data_dir,
+                connection_timeout=args.connection_timeout,
+                print_connection_url=args.print_connection_url,
+            )
+        )
         await session_mcp.start_proxy_server()
         mcp.mount(session_mcp.proxy_server)
         for middleware in session_mcp.middleware:
