@@ -71,3 +71,9 @@
 - Step name: Pre-commit staging check
 - Action: Ran `git add -A && git status --short --branch`.
 - Result: All intended files were staged for commit, including `CHANGELOG.md`, `README.md`, `docs/`, `pyproject.toml`, `src/colab_mcp/`, `tests/session_test.py`, and `uv.lock`.
+
+## 2026-06-06T12:19:37+05:30 - Fork remote setup
+
+- Step name: Fork remote setup
+- Action: Attempted to create a fork remote with GitHub CLI, logged the rejected command in `docs/problems/2026-06-06-gh-fork-remote-flag.md`, reran the supported command `gh repo fork --remote --remote-name fork`, and verified remotes with `git remote -v`.
+- Result: Created fork remote `fork` at `https://github.com/iamawanishmaurya/colab-mcp.git` and documented the fix in `docs/solutions/gh-fork-remote-flag.md`.
